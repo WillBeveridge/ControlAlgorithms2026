@@ -4,6 +4,11 @@ Code Authored by Keegan Kelly
 import cv2
 import numpy as np
 import sys
+
+import os
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+print("Saving to:", os.getcwd())
+
 ARUCO_DICT = {
     "DICT_4X4_50": cv2.aruco.DICT_4X4_50,
     "DICT_4X4_100": cv2.aruco.DICT_4X4_100,
@@ -30,5 +35,5 @@ ARUCO_DICT = {
 arucoDict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT["DICT_4X4_1000"])
 tag = np.zeros((600, 600, 1), dtype='uint8')
 # args, dict, id, sideLength, img variable, borderBits
-cv2.aruco.generateImageMarker(arucoDict, 16, 600, tag, 1)
-cv2.imwrite("aruco16.png", tag)
+cv2.aruco.generateImageMarker(arucoDict, 18, 600, tag, 1)
+cv2.imwrite("aruco18.png", tag)
