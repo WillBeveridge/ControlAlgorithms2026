@@ -11,7 +11,7 @@ import numpy as np
 from math import ceil
 import time
 filename = 'xlsxPaths/square.xlsx'
-address = 'http://192.168.0.103:3000/'
+address = 'http://192.168.0.101:3000/'
 
 NUM_ROBOTS = 6
 

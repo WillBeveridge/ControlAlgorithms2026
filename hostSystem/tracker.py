@@ -199,7 +199,7 @@ class Tracker:
         else:
             Focus = 0
         # initializes the video stream
-        self.vs = WebcamVideoStream(src=0, fps=frameRate, focus=Focus).start()
+        self.vs = WebcamVideoStream(src=1, fps=frameRate, focus=Focus).start()
         self.vs.start()
         # sets an initial outframe to prevent crashing before the first frame is processed
         self.outFrame = self.vs.frame
@@ -231,6 +231,7 @@ class Tracker:
     # checks if all NUM_ROBOTS agents are ready and then sets the start flag to true
     def checkReady(self):
         prevTime = time.time()
+        connected = set()
         while True:
             if (time.time() - prevTime) > 2:
                 prevTime = time.time()
@@ -239,7 +240,11 @@ class Tracker:
                 SUM = 0
                 for i in range(NUM_ROBOTS):
                     SUM += DATA[i]["ready"]
+                    if DATA[i]["ready"] == 1 and i not in connected:
+                        connected.add(i)
+                        print(f"Robot {i+1} connected!")
                 if SUM == NUM_ROBOTS:
+                    print("All robots connected! Starting...")
                     for i in range(NUM_ROBOTS):
                         requests.put(self.address+"agentGo/"+str(int(i+1)), json={'id': i+1, 'ready': 1})
                     break
