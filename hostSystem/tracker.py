@@ -134,12 +134,12 @@ class Tracker:
         LINE_UP = '\033[1A'
         LINE_CLEAR = '\x1b[2K'
 
-        printPositions = ""
+        #printPositions = ""
 
-        for i in range(1, NUM_ROBOTS + 1):
-            printPositions = printPositions + "(" + format(self.pos[i][0], '.2f') + ", " + format(self.pos[i][1], '.2f') + ", " + format(self.pos[i][2], '.2f') + ")"
+        #for i in range(1, NUM_ROBOTS + 1):
+            #printPositions = printPositions + "(" + format(self.pos[i][0], '.2f') + ", " + format(self.pos[i][1], '.2f') + ", " + format(self.pos[i][2], '.2f') + ")"
 
-        print(LINE_UP + LINE_CLEAR + printPositions)
+        #print(LINE_UP + LINE_CLEAR + printPositions)
 
         # Old Printing Method:
         #print(LINE_UP + LINE_CLEAR + "(" + format(self.pos[1][0], '.2f') + ", " + format(self.pos[1][1], '.2f') + ", " + format(self.pos[1][2], '.2f') + ")" + "(" + format(self.pos[2][0], '.2f') + ", " +
