@@ -81,7 +81,7 @@ class Tracker:
             angle += 2*np.pi
         return angle
 
-    def find_markerPos(self, frame):
+    def find_markerPos(self, frame, allPos=None):
         # accepts a frame and locates markers and updates their positions and draws their position and info onto the frame
         # converts to gray scale and finds the aruco markers
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -146,6 +146,65 @@ class Tracker:
         #      format(self.pos[2][1], '.2f') + ", " + format(self.pos[2][2], '.2f') + ")" + "(" + format(self.pos[3][0], '.2f') + ", " + format(self.pos[3][1], '.2f') + ", " + format(self.pos[3][2], '.2f') + ")"
         #      + "(" + format(self.pos[4][0], '.2f') + ", " + format(self.pos[4][1], '.2f') + ", " + format(self.pos[4][2], '.2f') + ")")
         
+        if allPos is not None:
+            frame = self.draw_grid(frame, allPos)
+        return frame
+
+    def draw_grid(self, frame, allPos, grid_step=0.25):
+        if not self.originFound:
+            return frame
+
+        x_all = allPos[:, 1::2]
+        y_all = allPos[:, 2::2]
+        x_min = np.floor(x_all.min() / grid_step) * grid_step
+        x_max = np.ceil(x_all.max() / grid_step) * grid_step
+        y_min = np.floor(y_all.min() / grid_step) * grid_step
+        y_max = np.ceil(y_all.max() / grid_step) * grid_step
+
+        grid_x = np.arange(x_min, x_max + grid_step, grid_step)
+        grid_y = np.arange(y_min, y_max + grid_step, grid_step)
+
+        for x in grid_x:
+            pts = np.array([[x, y, 0.0] for y in grid_y], dtype=np.float32)
+            imgpts, _ = cv2.projectPoints(pts, self.originR[0][0], self.originT[0][0],
+                                        self.mtx, self.dist)
+            imgpts = imgpts.reshape(-1, 2).astype(int)
+            for i in range(len(imgpts) - 1):
+                cv2.line(frame, tuple(imgpts[i]), tuple(imgpts[i+1]), (80, 80, 80), 1)
+
+        for y in grid_y:
+            pts = np.array([[x, y, 0.0] for x in grid_x], dtype=np.float32)
+            imgpts, _ = cv2.projectPoints(pts, self.originR[0][0], self.originT[0][0],
+                                        self.mtx, self.dist)
+            imgpts = imgpts.reshape(-1, 2).astype(int)
+            for i in range(len(imgpts) - 1):
+                cv2.line(frame, tuple(imgpts[i]), tuple(imgpts[i+1]), (80, 80, 80), 1)
+
+        for x in grid_x:
+            for y in grid_y:
+                pt, _ = cv2.projectPoints(np.array([[x, y, 0.0]], dtype=np.float32),
+                                        self.originR[0][0], self.originT[0][0],
+                                        self.mtx, self.dist)
+                px, py = pt.reshape(2).astype(int)
+                cv2.circle(frame, (px, py), 2, (80, 80, 80), -1)
+                if x == 0 or y == 0:
+                    cv2.putText(frame, f"({x:.2f},{y:.2f})", (px + 3, py - 3),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 220, 220), 1)
+
+        colors = [(0,0,255),(0,255,0),(255,0,0),(0,255,255),(255,0,255),(255,255,0)]
+        for robot_idx in range(NUM_ROBOTS):
+            x_col = 2 * robot_idx + 1
+            y_col = 2 * robot_idx + 2
+            path_pts = np.array([[allPos[i, x_col], allPos[i, y_col], 0.0]
+                                for i in range(len(allPos))], dtype=np.float32)
+            imgpts, _ = cv2.projectPoints(path_pts, self.originR[0][0], self.originT[0][0],
+                                        self.mtx, self.dist)
+            imgpts = imgpts.reshape(-1, 2).astype(int)
+            for pt in imgpts:
+                cv2.circle(frame, tuple(pt), 3, colors[robot_idx], -1)
+            for i in range(len(imgpts) - 1):
+                cv2.line(frame, tuple(imgpts[i]), tuple(imgpts[i+1]), colors[robot_idx], 1)
+
         return frame
 
     def startThreads(self):

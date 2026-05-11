@@ -5,7 +5,7 @@ Modified for manual wireless control (no camera/localization)
 
 #include "RobotControl.h"
 #define id 4
-String server = "http://192.168.0.101:3000";
+String server = "http://192.168.0.102:3000";
 
 void setup(void)
 {
