@@ -81,7 +81,7 @@ class Tracker:
             angle += 2*np.pi
         return angle
 
-    def find_markerPos(self, frame, allPos=None):
+    def find_markerPos(self, frame, allPos=None):   
         # accepts a frame and locates markers and updates their positions and draws their position and info onto the frame
         # converts to gray scale and finds the aruco markers
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -192,7 +192,8 @@ class Tracker:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 220, 220), 1)
 
         colors = [(0,0,255),(0,255,0),(255,0,0),(0,255,255),(255,0,255),(255,255,0)]
-        for robot_idx in range(NUM_ROBOTS):
+        num_robots_in_file = (allPos.shape[1] - 1) // 2
+        for robot_idx in range(num_robots_in_file):
             x_col = 2 * robot_idx + 1
             y_col = 2 * robot_idx + 2
             path_pts = np.array([[allPos[i, x_col], allPos[i, y_col], 0.0]
