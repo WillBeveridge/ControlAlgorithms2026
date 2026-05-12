@@ -12,7 +12,7 @@ import logging
 # Suppress Flask request logs so they don't clutter the prompt
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-HOST = "192.168.0.101"
+HOST = "192.168.0.102"
 PORT = 3000
 ROBOT_ID = 4
 DT = 0.5    # time step between waypoints (seconds)
