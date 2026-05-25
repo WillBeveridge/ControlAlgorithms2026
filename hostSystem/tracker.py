@@ -131,15 +131,15 @@ class Tracker:
         if dt != 0:
             cv2.putText(frame, "FPS: " + format(1/dt, '.2f'), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         # prints data
-        LINE_UP = '\033[1A'
-        LINE_CLEAR = '\x1b[2K'
+        #LINE_UP = '\033[1A'
+        #LINE_CLEAR = '\x1b[2K'
 
-        printPositions = ""
+        #printPositions = ""
 
-        for i in range(1, NUM_ROBOTS + 1):
-            printPositions = printPositions + "(" + format(self.pos[i][0], '.2f') + ", " + format(self.pos[i][1], '.2f') + ", " + format(self.pos[i][2], '.2f') + ")"
+        #for i in range(1, NUM_ROBOTS + 1):
+        #    printPositions = printPositions + "(" + format(self.pos[i][0], '.2f') + ", " + format(self.pos[i][1], '.2f') + ", " + format(self.pos[i][2], '.2f') + ")"
 
-        print(LINE_UP + LINE_CLEAR + printPositions)
+        #print(LINE_UP + LINE_CLEAR + printPositions)
 
         # Old Printing Method:
         #print(LINE_UP + LINE_CLEAR + "(" + format(self.pos[1][0], '.2f') + ", " + format(self.pos[1][1], '.2f') + ", " + format(self.pos[1][2], '.2f') + ")" + "(" + format(self.pos[2][0], '.2f') + ", " +
@@ -148,7 +148,10 @@ class Tracker:
         
         return frame
 
-    def startThreads(self):
+##for running goto.py
+    def startThreads(self, check_ready=True):
+##for running main.py
+    ##def startThreads(self):
         # starts threads for reading in new frames, displaying frames, processing frames, and sending data to the server
         self.Stop = False
         self.runGetFrame(frameRate=self.frameRate)
@@ -161,9 +164,16 @@ class Tracker:
         t1 = Thread(target=self.runPutThread)
         t1.daemon = False
         t1.start()
-        t4 = Thread(target=self.checkReady)
-        t4.daemon = False
-        t4.start()
+##for running goto.py
+        if check_ready:
+            t4 = Thread(target=self.checkReady)
+            t4.daemon = False
+            t4.start()
+##for running main.py
+        ##t4 = Thread(target=self.checkReady)
+        ##t4.daemon = False
+        ##t4.start()
+            
         return self
 
     # ends the thread for put requests

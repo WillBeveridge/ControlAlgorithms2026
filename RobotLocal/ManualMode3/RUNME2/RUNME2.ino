@@ -7,7 +7,7 @@ preventing it from executing stale paths on boot.
 #include "RobotControl.h"
 
 // ── Change this ID for each robot (1–6) ──────────────────────────────────────
-#define id 4
+#define id 3
 // ─────────────────────────────────────────────────────────────────────────────
 
 String server = "http://192.168.0.100:3000";
