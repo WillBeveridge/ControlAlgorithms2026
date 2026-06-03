@@ -9,43 +9,42 @@ Usage:
 
 Interactive commands:
     go <x> <y>   — Send the robot to a coordinate
+                   Blocked if the path passes within STOP_DISTANCE of
+                   the obstacle (ArUco 18), checked both before and after staging.
     pos          — Print the robot's current camera-tracked position
+    obstacle     — Print the current obstacle position and distance to this robot
     quit         — Exit (also stops the tracker)
 
 Press 'q' in the camera window to quit.
 Press 'r' in the camera window to reset the origin marker.
+Press 'c' in the camera window to redo spatial calibration.
+
+The tracker's checkSafety thread runs continuously and will cut agentGo=0 for
+any robot that gets within STOP_DISTANCE of the obstacle at runtime,
+regardless of which command sent it there.
 """
 
 import time
 import argparse
 import requests
 import threading
-from tracker2 import Tracker
+import numpy as np
+from tracker2 import Tracker, STOP_DISTANCE
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SERVER        = "http://192.168.0.101:3000"
 PATH_STEPS    = 5     # interpolated waypoints between current pos and target
-DT            = 0.5    # seconds between waypoints (matches db.json)
-READY_TIMEOUT = 30     # seconds to wait for robot to reach staging
+DT            = 0.5   # seconds between waypoints (matches db.json)
+READY_TIMEOUT = 30    # seconds to wait for robot to reach staging
 NUM_ROBOTS    = 6
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
-def reset_signals(agent_id: int) -> None:
-    requests.put(f"{SERVER}/agentGo/{agent_id}",
-                json={"id": agent_id, "ready": 0}, timeout=3)
-    requests.put(f"{SERVER}/agentReady/{agent_id}",
-                json={"id": agent_id, "ready": 0}, timeout=3)
-
 def send_path(agent_id: int, waypoints: list, update: int) -> None:
-    """
-    PUT /goal{id}/1
-    path[0] = current position so the robot's staging step is instant.
-    """
     payload = {
-        "id":     1,        # chunk index (not agent ID) — RUNME uses this as the loop counter
+        "id":     1,
         "path":   [[round(x, 4), round(y, 4)] for x, y in waypoints],
         "dt":     DT,
         "update": update,
@@ -56,7 +55,6 @@ def send_path(agent_id: int, waypoints: list, update: int) -> None:
 
 
 def wait_for_ready(agent_id: int, timeout: float = READY_TIMEOUT) -> bool:
-    """Poll agentReady until the robot signals ready=1. Returns False on timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -71,21 +69,17 @@ def wait_for_ready(agent_id: int, timeout: float = READY_TIMEOUT) -> bool:
 
 def send_go(agent_id: int) -> None:
     requests.put(f"{SERVER}/agentGo/{agent_id}",
-                json={"id": agent_id, "ready": 1}, timeout=3)
-    time.sleep(1.0)  # give robot time to read the 1
+                 json={"id": agent_id, "ready": 1}, timeout=3)
+    time.sleep(1.0)
     requests.put(f"{SERVER}/agentGo/{agent_id}",
-                json={"id": agent_id, "ready": 0}, timeout=3)
+                 json={"id": agent_id, "ready": 0}, timeout=3)
 
 
 # ── Path generation ───────────────────────────────────────────────────────────
 
-def make_path(cx: float, cy: float,
-            tx: float, ty: float,
-            steps: int = PATH_STEPS) -> list:
-    """
-    Straight-line interpolation from current pos to target.
-    Returns `steps` waypoints ending exactly at the target.
-    """
+def make_path(cx: float, cy: float, tx: float, ty: float,
+              steps: int = PATH_STEPS) -> list:
+    """Straight-line interpolation from current position to target."""
     return [
         (cx + (tx - cx) * i / steps,
          cy + (ty - cy) * i / steps)
@@ -93,11 +87,31 @@ def make_path(cx: float, cy: float,
     ]
 
 
+# ── Obstacle clearance check ──────────────────────────────────────────────────
+
+def path_clears_obstacle(tracker: Tracker, waypoints: list) -> tuple:
+    """
+    Check every waypoint against the current obstacle position.
+    Returns (ok: bool, closest_dist: float | None).
+    If the obstacle hasn't been detected yet, always returns True so the
+    operator isn't blocked by a missing marker.
+    """
+    if not tracker.obstacleFound or tracker.obstaclePos is None:
+        return True, None
+
+    obs_xy = np.array(tracker.obstaclePos[:2])
+    min_dist = min(
+        float(np.linalg.norm(np.array([wx, wy]) - obs_xy))
+        for wx, wy in waypoints
+    )
+    return (min_dist > STOP_DISTANCE), min_dist
+
+
 # ── Main REPL ─────────────────────────────────────────────────────────────────
 
 def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
     print(f"\ngoto.py  |  Agent {agent_id}  |  {SERVER}")
-    print("Commands:  go <x> <y>   pos   quit\n")
+    print("Commands:  go <x> <y>   pos   obstacle   quit\n")
 
     while True:
         try:
@@ -121,10 +135,21 @@ def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
 
         # ── pos ───────────────────────────────────────────────────────────────
         elif cmd == "pos":
-            x = tracker.pos[agent_id][0]
-            y = tracker.pos[agent_id][1]
-            t = tracker.pos[agent_id][2]
+            x, y, t = tracker.pos[agent_id]
             print(f"  Agent {agent_id}  x={x:.4f}  y={y:.4f}  θ={t:.4f}")
+
+        # ── obstacle ──────────────────────────────────────────────────────────
+        elif cmd == "obstacle":
+            if tracker.obstacleFound and tracker.obstaclePos is not None:
+                ox, oy, ot = tracker.obstaclePos
+                robot_xy = np.array(tracker.pos[agent_id][:2])
+                obs_xy   = np.array([ox, oy])
+                dist     = float(np.linalg.norm(robot_xy - obs_xy))
+                print(f"  Obstacle (ArUco 18)  x={ox:.4f}  y={oy:.4f}  θ={ot:.4f}")
+                print(f"  Distance from Agent {agent_id}: {dist:.4f} m  "
+                      f"(stop at {STOP_DISTANCE} m)")
+            else:
+                print("  Obstacle (ArUco 18) not yet detected in frame.")
 
         # ── go <x> <y> ────────────────────────────────────────────────────────
         elif cmd == "go":
@@ -137,87 +162,90 @@ def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
                 print("  x and y must be numbers, e.g.:  go 0.5 1.2")
                 continue
 
-            # Read current position directly from tracker
-            cx = tracker.pos[agent_id][0]
-            cy = tracker.pos[agent_id][1]
+            cx, cy = tracker.pos[agent_id][0], tracker.pos[agent_id][1]
             print(f"  Current  ({cx:.4f}, {cy:.4f})")
             print(f"  Target   ({tx:.4f}, {ty:.4f})")
 
-            # 1. Write path first
             waypoints = make_path(cx, cy, tx, ty, steps=steps)
+
+            # ── Pre-flight obstacle check ─────────────────────────────────────
+            ok, closest = path_clears_obstacle(tracker, waypoints)
+            if not ok:
+                print(
+                    f"  \033[91m[BLOCKED]  Path passes within {closest:.3f} m of the obstacle "
+                    f"(limit={STOP_DISTANCE} m). Choose a different target.\033[0m"
+                )
+                continue
+            if closest is not None:
+                print(f"  Path OK — closest approach to obstacle: {closest:.3f} m")
+
+            # 1. Write path to server
             try:
                 send_path(agent_id, waypoints, update_rate)
                 print(f"  Path written  ({len(waypoints)} waypoints)")
-                print(f"  Waypoints: {waypoints}")
             except requests.RequestException as e:
                 print(f"  Error writing path: {e}")
                 continue
 
-            # 2. Reset signals AFTER path is written
+            # 2. Reset signals after path is written
             try:
                 requests.put(f"{SERVER}/agentGo/{agent_id}",
-                            json={"id": agent_id, "ready": 0}, timeout=3)
+                             json={"id": agent_id, "ready": 0}, timeout=3)
                 requests.put(f"{SERVER}/agentReady/{agent_id}",
-                            json={"id": agent_id, "ready": 0}, timeout=3)
+                             json={"id": agent_id, "ready": 0}, timeout=3)
             except requests.RequestException as e:
                 print(f"  Error resetting signals: {e}")
                 continue
 
             # 3. Wait for robot to call setReady()
             print(f"  Waiting for Agent {agent_id} to reach staging...",
-                end="", flush=True)
+                  end="", flush=True)
             if not wait_for_ready(agent_id):
                 print(f"\n  Timed out after {READY_TIMEOUT}s — is the robot running?")
                 continue
             print(" ready!")
 
-            # 4. Fire go signal — robot starts executing the path
+            # ── Pre-go obstacle re-check (obstacle may have moved during staging)
+            ok, closest = path_clears_obstacle(tracker, waypoints)
+            if not ok:
+                print(
+                    f"  \033[91m[BLOCKED]  Obstacle moved into path (now {closest:.3f} m away). "
+                    f"Aborting move.\033[0m"
+                )
+                continue
+
+            # 4. Fire go signal
             try:
                 send_go(agent_id)
                 print(f"  Go!  Agent {agent_id} is moving.")
-                print(f"  (press enter to stop monitoring)")
+                print("  (press Enter to stop monitoring)")
                 stop_monitor = threading.Event()
 
                 def monitor():
                     while not stop_monitor.is_set():
-                        x = tracker.pos[agent_id][0]
-                        y = tracker.pos[agent_id][1]
-                        t = tracker.pos[agent_id][2]
+                        x, y, t = tracker.pos[agent_id]
+                        obs_str = ""
+                        if tracker.obstacleFound and tracker.obstaclePos is not None:
+                            d = float(np.linalg.norm(
+                                np.array([x, y]) - np.array(tracker.obstaclePos[:2])
+                            ))
+                            obs_str = f"  obs_dist={d:.3f} m"
                         print(f"  [pos]  x={x:.4f}  y={y:.4f}  θ={t:.4f}  "
-                              f"target=({tx:.4f},{ty:.4f})")
+                              f"target=({tx:.4f},{ty:.4f}){obs_str}")
                         time.sleep(2.0)
 
-                m = threading.Thread(target=monitor)
-                m.daemon = True
+                m = threading.Thread(target=monitor, daemon=True)
                 m.start()
                 input()
                 stop_monitor.set()
-                print(f"  Monitoring stopped.")
-            except requests.RequestException as e:
-                print(f"  Error sending go: {e}")
-
-                def monitor():
-                    while not stop_monitor.is_set():
-                        x = tracker.pos[agent_id][0]
-                        y = tracker.pos[agent_id][1]
-                        t = tracker.pos[agent_id][2]
-                        print(f"  [pos]  x={x:.4f}  y={y:.4f}  θ={t:.4f}  "
-                              f"target=({tx:.4f},{ty:.4f})")
-                        time.sleep(2.0)
-
-                m = threading.Thread(target=monitor)
-                m.daemon = True
-                m.start()
-                input()
-                stop_monitor.set()
-                print(f"  Monitoring stopped.")
+                print("  Monitoring stopped.")
             except requests.RequestException as e:
                 print(f"  Error sending go: {e}")
 
         # ── unknown ───────────────────────────────────────────────────────────
         else:
             print(f"  Unknown command: '{cmd}'")
-            print("  Commands:  go <x> <y>   pos   quit")
+            print("  Commands:  go <x> <y>   pos   obstacle   quit")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -226,26 +254,16 @@ def main() -> None:
     global SERVER
 
     parser = argparse.ArgumentParser(
-        description="Tracker + robot navigation controller. Replaces main.py."
+        description="Tracker + robot navigation controller."
     )
-    parser.add_argument(
-        "--agent", type=int, default=None, metavar="ID",
-        help="Agent ID to start with, 1-6 (will prompt if not provided)"
-    )
-    parser.add_argument(
-        "--steps", type=int, default=PATH_STEPS, metavar="N",
-        help=f"Interpolated waypoints in path (default: {PATH_STEPS})"
-    )
-    parser.add_argument(
-        "--server", default=SERVER, metavar="URL",
-        help=f"API server URL (default: {SERVER})"
-    )
+    parser.add_argument("--agent", type=int, default=None, metavar="ID")
+    parser.add_argument("--steps", type=int, default=PATH_STEPS, metavar="N")
+    parser.add_argument("--server", default=SERVER, metavar="URL")
     args = parser.parse_args()
 
-    SERVER = args.server
+    SERVER  = args.server
     address = SERVER + "/"
 
-    # ── Ask lens type (same as original main.py) ──────────────────────────────
     while True:
         ans = input("Is the lens a wide angle lens (120 fov)? (y/n): ")
         if ans.lower() in ("y", "n"):
@@ -253,7 +271,6 @@ def main() -> None:
             break
         print("Invalid input.")
 
-    # ── Ask localization update rate (same as original main.py) ──────────────
     while True:
         ans = input("After how many movements should the robot localize? (1-5): ")
         if ans.isdigit() and 1 <= int(ans) <= 5:
@@ -261,7 +278,6 @@ def main() -> None:
             break
         print("Invalid input.")
 
-    # ── Ask which agent to start with (if not passed as --agent) ─────────────
     agent_id = args.agent
     if agent_id is None:
         while True:
@@ -271,24 +287,21 @@ def main() -> None:
                 break
             print("Invalid input.")
 
-    # ── Reset all go signals (not agentReady — robots set that themselves) ──────
     for i in range(1, NUM_ROBOTS + 1):
         requests.put(f"{address}agentGo/{i}", json={"id": i, "ready": 0})
         requests.put(f"{address}agentReady/{i}", json={"id": i, "ready": 0})
 
-    # ── Start tracker without checkReady ─────────────────────────────────────
-    # checkReady fires go for ALL robots at once — goto.py handles this
-    # per-robot instead, so we pass check_ready=False to skip that thread.
     print("Starting tracker... (ensure origin marker is visible in frame)")
     tracker = Tracker(
         marker_width=0.1585,
         aruco_type="DICT_4X4_1000",
         address=address,
-        wideAngle=wide_angle
+        wideAngle=wide_angle,
     )
+    # check_ready=False: goto.py drives each robot individually rather than
+    # firing all at once. checkSafety starts automatically inside startThreads.
     tracker.startThreads(check_ready=False)
 
-    # ── Run interactive command loop ──────────────────────────────────────────
     run(tracker, agent_id, args.steps, update_rate)
 
 

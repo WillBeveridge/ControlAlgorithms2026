@@ -19,12 +19,11 @@ Press 'r' in the camera window to reset the origin marker.
 import time
 import argparse
 import requests
-import threading
-from tracker2 import Tracker
+from tracker import Tracker
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SERVER        = "http://192.168.0.101:3000"
-PATH_STEPS    = 5     # interpolated waypoints between current pos and target
+SERVER        = "http://192.168.0.100:3000"
+PATH_STEPS    = 10     # interpolated waypoints between current pos and target
 DT            = 0.5    # seconds between waypoints (matches db.json)
 READY_TIMEOUT = 30     # seconds to wait for robot to reach staging
 NUM_ROBOTS    = 6
@@ -72,9 +71,6 @@ def wait_for_ready(agent_id: int, timeout: float = READY_TIMEOUT) -> bool:
 def send_go(agent_id: int) -> None:
     requests.put(f"{SERVER}/agentGo/{agent_id}",
                 json={"id": agent_id, "ready": 1}, timeout=3)
-    time.sleep(1.0)  # give robot time to read the 1
-    requests.put(f"{SERVER}/agentGo/{agent_id}",
-                json={"id": agent_id, "ready": 0}, timeout=3)
 
 
 # ── Path generation ───────────────────────────────────────────────────────────
@@ -137,33 +133,29 @@ def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
                 print("  x and y must be numbers, e.g.:  go 0.5 1.2")
                 continue
 
-            # Read current position directly from tracker
+            # Read current position directly from tracker (no HTTP round-trip)
             cx = tracker.pos[agent_id][0]
             cy = tracker.pos[agent_id][1]
             print(f"  Current  ({cx:.4f}, {cy:.4f})")
             print(f"  Target   ({tx:.4f}, {ty:.4f})")
 
-            # 1. Write path first
-            waypoints = make_path(cx, cy, tx, ty, steps=steps)
+            # 1. Reset stale signals from last run
             try:
-                send_path(agent_id, waypoints, update_rate)
-                print(f"  Path written  ({len(waypoints)} waypoints)")
-                print(f"  Waypoints: {waypoints}")
-            except requests.RequestException as e:
-                print(f"  Error writing path: {e}")
-                continue
-
-            # 2. Reset signals AFTER path is written
-            try:
-                requests.put(f"{SERVER}/agentGo/{agent_id}",
-                            json={"id": agent_id, "ready": 0}, timeout=3)
-                requests.put(f"{SERVER}/agentReady/{agent_id}",
-                            json={"id": agent_id, "ready": 0}, timeout=3)
+                reset_signals(agent_id)
             except requests.RequestException as e:
                 print(f"  Error resetting signals: {e}")
                 continue
 
-            # 3. Wait for robot to call setReady()
+            # 2. Write path — path[0] is current pos so staging is instant
+            waypoints = make_path(cx, cy, tx, ty, steps=steps)
+            try:
+                send_path(agent_id, waypoints, update_rate)
+                print(f"  Path written  ({len(waypoints)} waypoints)")
+            except requests.RequestException as e:
+                print(f"  Error writing path: {e}")
+                continue
+
+            # 3. Wait for robot to loop back, fetch path, reach staging, setReady()
             print(f"  Waiting for Agent {agent_id} to reach staging...",
                 end="", flush=True)
             if not wait_for_ready(agent_id):
@@ -175,42 +167,6 @@ def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
             try:
                 send_go(agent_id)
                 print(f"  Go!  Agent {agent_id} is moving.")
-                print(f"  (press enter to stop monitoring)")
-                stop_monitor = threading.Event()
-
-                def monitor():
-                    while not stop_monitor.is_set():
-                        x = tracker.pos[agent_id][0]
-                        y = tracker.pos[agent_id][1]
-                        t = tracker.pos[agent_id][2]
-                        print(f"  [pos]  x={x:.4f}  y={y:.4f}  θ={t:.4f}  "
-                              f"target=({tx:.4f},{ty:.4f})")
-                        time.sleep(2.0)
-
-                m = threading.Thread(target=monitor)
-                m.daemon = True
-                m.start()
-                input()
-                stop_monitor.set()
-                print(f"  Monitoring stopped.")
-            except requests.RequestException as e:
-                print(f"  Error sending go: {e}")
-
-                def monitor():
-                    while not stop_monitor.is_set():
-                        x = tracker.pos[agent_id][0]
-                        y = tracker.pos[agent_id][1]
-                        t = tracker.pos[agent_id][2]
-                        print(f"  [pos]  x={x:.4f}  y={y:.4f}  θ={t:.4f}  "
-                              f"target=({tx:.4f},{ty:.4f})")
-                        time.sleep(2.0)
-
-                m = threading.Thread(target=monitor)
-                m.daemon = True
-                m.start()
-                input()
-                stop_monitor.set()
-                print(f"  Monitoring stopped.")
             except requests.RequestException as e:
                 print(f"  Error sending go: {e}")
 
@@ -274,7 +230,6 @@ def main() -> None:
     # ── Reset all go signals (not agentReady — robots set that themselves) ──────
     for i in range(1, NUM_ROBOTS + 1):
         requests.put(f"{address}agentGo/{i}", json={"id": i, "ready": 0})
-        requests.put(f"{address}agentReady/{i}", json={"id": i, "ready": 0})
 
     # ── Start tracker without checkReady ─────────────────────────────────────
     # checkReady fires go for ALL robots at once — goto.py handles this
