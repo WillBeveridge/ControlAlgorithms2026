@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-goto.py — Combined tracker + robot navigation controller.
-Replaces main.py. Run alongside api.py only.
+move.py — Combined tracker + robot navigation controller.
+Run alongside api2.py only.
 
 Usage:
-    python goto.py              # will ask which agent at startup
-    python goto.py --agent 2    # skip the startup prompt
+    python move.py              # will ask which agent at startup
+    python move.py --agent 2    # skip the startup prompt
 
 Interactive commands:
     go <x> <y>   — Send the robot to a coordinate
-                   Blocked if the path passes within STOP_DISTANCE of
-                   the obstacle (ArUco 18), checked both before and after staging.
     pos          — Print the robot's current camera-tracked position
     obstacle     — Print the current obstacle position and distance to this robot
     quit         — Exit (also stops the tracker)
@@ -19,9 +17,9 @@ Press 'q' in the camera window to quit.
 Press 'r' in the camera window to reset the origin marker.
 Press 'c' in the camera window to redo spatial calibration.
 
-The tracker's checkSafety thread runs continuously and will cut agentGo=0 for
-any robot that gets within STOP_DISTANCE of the obstacle at runtime,
-regardless of which command sent it there.
+The tracker's checkSafety thread runs continuously and will set agentStop=1 for
+any two markers (robots or obstacle) that come within STOP_DISTANCE of each other.
+The robot polls agentStop inside moveTo and halts immediately when it fires.
 """
 
 import time
@@ -87,30 +85,10 @@ def make_path(cx: float, cy: float, tx: float, ty: float,
     ]
 
 
-# ── Obstacle clearance check ──────────────────────────────────────────────────
-
-def path_clears_obstacle(tracker: Tracker, waypoints: list) -> tuple:
-    """
-    Check every waypoint against the current obstacle position.
-    Returns (ok: bool, closest_dist: float | None).
-    If the obstacle hasn't been detected yet, always returns True so the
-    operator isn't blocked by a missing marker.
-    """
-    if not tracker.obstacleFound or tracker.obstaclePos is None:
-        return True, None
-
-    obs_xy = np.array(tracker.obstaclePos[:2])
-    min_dist = min(
-        float(np.linalg.norm(np.array([wx, wy]) - obs_xy))
-        for wx, wy in waypoints
-    )
-    return (min_dist > STOP_DISTANCE), min_dist
-
-
 # ── Main REPL ─────────────────────────────────────────────────────────────────
 
 def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
-    print(f"\ngoto.py  |  Agent {agent_id}  |  {SERVER}")
+    print(f"\nmove.py  |  Agent {agent_id}  |  {SERVER}")
     print("Commands:  go <x> <y>   pos   obstacle   quit\n")
 
     while True:
@@ -168,17 +146,6 @@ def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
 
             waypoints = make_path(cx, cy, tx, ty, steps=steps)
 
-            # ── Pre-flight obstacle check ─────────────────────────────────────
-            ok, closest = path_clears_obstacle(tracker, waypoints)
-            if not ok:
-                print(
-                    f"  \033[91m[BLOCKED]  Path passes within {closest:.3f} m of the obstacle "
-                    f"(limit={STOP_DISTANCE} m). Choose a different target.\033[0m"
-                )
-                continue
-            if closest is not None:
-                print(f"  Path OK — closest approach to obstacle: {closest:.3f} m")
-
             # 1. Write path to server
             try:
                 send_path(agent_id, waypoints, update_rate)
@@ -189,6 +156,9 @@ def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
 
             # 2. Reset signals after path is written
             try:
+                tracker.clearStoppedRobot(agent_id)
+                requests.put(f"{SERVER}/agentStop/{agent_id}",
+                             json={"id": agent_id, "stop": 0}, timeout=3)
                 requests.put(f"{SERVER}/agentGo/{agent_id}",
                              json={"id": agent_id, "ready": 0}, timeout=3)
                 requests.put(f"{SERVER}/agentReady/{agent_id}",
@@ -204,15 +174,6 @@ def run(tracker: Tracker, agent_id: int, steps: int, update_rate: int) -> None:
                 print(f"\n  Timed out after {READY_TIMEOUT}s — is the robot running?")
                 continue
             print(" ready!")
-
-            # ── Pre-go obstacle re-check (obstacle may have moved during staging)
-            ok, closest = path_clears_obstacle(tracker, waypoints)
-            if not ok:
-                print(
-                    f"  \033[91m[BLOCKED]  Obstacle moved into path (now {closest:.3f} m away). "
-                    f"Aborting move.\033[0m"
-                )
-                continue
 
             # 4. Fire go signal
             try:
@@ -288,6 +249,7 @@ def main() -> None:
             print("Invalid input.")
 
     for i in range(1, NUM_ROBOTS + 1):
+        requests.put(f"{address}agentStop/{i}", json={"id": i, "stop": 0})
         requests.put(f"{address}agentGo/{i}", json={"id": i, "ready": 0})
         requests.put(f"{address}agentReady/{i}", json={"id": i, "ready": 0})
 
@@ -298,8 +260,6 @@ def main() -> None:
         address=address,
         wideAngle=wide_angle,
     )
-    # check_ready=False: goto.py drives each robot individually rather than
-    # firing all at once. checkSafety starts automatically inside startThreads.
     tracker.startThreads(check_ready=False)
 
     run(tracker, agent_id, args.steps, update_rate)

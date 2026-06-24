@@ -1,6 +1,6 @@
 """
 Code authored by Keegan Kelly
-Modified: added corner-marker spatial calibration (2D affine) to correct
+Modified: added corner-marker spatial calibration (homography) to correct
 distance/scale errors without relying solely on the intrinsic camera calibration.
 
 Modified 2025: unified safety-stop thread added.
@@ -11,7 +11,7 @@ SETUP:
   2. Place them at measured real-world positions relative to the origin marker.
      Edit CORNER_MARKER_REAL_POSITIONS below with those measurements (in metres).
   3. Run as normal.  The script will wait until all corner markers are seen,
-     average CORNER_CALIB_SAMPLES frames for each, fit the affine transform,
+     average CORNER_CALIB_SAMPLES frames for each, fit the homography transform,
      then print the calibration error and start tracking.
   4. Press 'c' in the video window to redo calibration without restarting.
 
@@ -19,7 +19,7 @@ OBSTACLE (ArUco ID 18):
   Optionally place marker 18 anywhere in the field.  It is tracked like a robot
   marker but is never used for calibration.  The checkSafety thread treats it
   exactly like a robot — if any two tracked markers (robots or obstacle) come
-  within STOP_DISTANCE of each other, agentGo is cut to 0 for both.
+  within STOP_DISTANCE of each other, agentStop is set to 1 for both.
 """
 
 import cv2
@@ -42,7 +42,7 @@ NUM_ROBOTS = 6
 # ── Safety thresholds (metres) — apply to any two tracked markers ─────────────
 # This covers robot↔robot and robot↔obstacle (ArUco 18) equally.
 WARN_DISTANCE = 0.5   # yellow warning printed to terminal
-STOP_DISTANCE = 0.3   # agentGo cut to 0 for both robots involved
+STOP_DISTANCE = 0.3   # agentStop set to 1 for both robots involved
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Corner marker configuration ───────────────────────────────────────────────
@@ -78,14 +78,18 @@ class Tracker:
     pos = np.zeros((NUMMARKERS, 3))
     pos[0] = [0, 0, np.pi/2]
 
+    # Tracks the last time each marker ID was actually detected in a frame.
+    # Used by checkSafety to fire a stop when a robot leaves the camera view.
+    lastSeen = {}          # {marker_id: float (time.time())}
+    LOST_FRAMES = 5        # consecutive checkSafety ticks without detection before stop fires
+
     # Obstacle state
     obstaclePos   = None   # [x, y, θ] once first seen; updated every frame
     obstacleFound = False
 
     originFound = False
 
-    affineM = np.array([[1.0, 0.0, 0.0],
-                        [0.0, 1.0, 0.0]])
+    homoM = np.eye(3, dtype=np.float64)   # 3x3 homography, identity until calibrated
     spatialCalibDone = False
 
     ARUCO_DICT = {
@@ -127,6 +131,7 @@ class Tracker:
             self.dist = npfile["dist"]
         self._cornerSamples = {mid: [] for mid in CORNER_MARKER_REAL_POSITIONS}
         self._recalibrateFlag = False
+        self._safety_clear = set()   # robot IDs to unblock on next checkSafety tick
 
     # ── Angle utility ─────────────────────────────────────────────────────────
 
@@ -175,7 +180,7 @@ class Tracker:
                 break
             time.sleep(1.0 / self.frameRate)
 
-        print("\n[SpatialCalib] Fitting affine transform...")
+        print("\n[SpatialCalib] Fitting homography...")
 
         raw_pts  = []
         true_pts = []
@@ -188,32 +193,34 @@ class Tracker:
             print(f"  Marker {mid}: raw avg=({avg_x:.4f}, {avg_y:.4f})  "
                   f"true=({true_xy[0]:.4f}, {true_xy[1]:.4f})")
 
-        raw_pts  = np.array(raw_pts,  dtype=np.float64)
-        true_pts = np.array(true_pts, dtype=np.float64)
+        raw_pts  = np.array(raw_pts,  dtype=np.float32)
+        true_pts = np.array(true_pts, dtype=np.float32)
 
-        N = len(raw_pts)
-        A = np.hstack([raw_pts, np.ones((N, 1))])
-        row_x, _, _, _ = np.linalg.lstsq(A, true_pts[:, 0], rcond=None)
-        row_y, _, _, _ = np.linalg.lstsq(A, true_pts[:, 1], rcond=None)
-        M = np.array([row_x, row_y])
+        # findHomography needs shape (N,1,2)
+        M, mask = cv2.findHomography(raw_pts.reshape(-1, 1, 2),
+                                     true_pts.reshape(-1, 1, 2))
 
+        # Reprojection error
         errors = []
-        for i in range(N):
-            pred = M @ np.array([raw_pts[i, 0], raw_pts[i, 1], 1.0])
-            err  = np.linalg.norm(pred - true_pts[i])
+        for i in range(len(raw_pts)):
+            src = np.array([raw_pts[i, 0], raw_pts[i, 1], 1.0], dtype=np.float64)
+            dst = M @ src
+            dst /= dst[2]
+            err = np.linalg.norm(dst[:2] - true_pts[i])
             errors.append(err)
         mean_err = np.mean(errors)
         max_err  = np.max(errors)
         print(f"[SpatialCalib] Done.  Mean reprojection error: {mean_err*100:.2f} cm  "
               f"Max: {max_err*100:.2f} cm")
-        print(f"[SpatialCalib] Affine matrix:\n{M}")
+        print(f"[SpatialCalib] Homography matrix:\n{M}")
 
-        self.affineM = M
+        self.homoM = M
         self.spatialCalibDone = True
         self._recalibrateFlag = False
 
-    def _applyAffine(self, x, y):
-        pt = self.affineM @ np.array([x, y, 1.0])
+    def _applyHomography(self, x, y):
+        pt = self.homoM @ np.array([x, y, 1.0], dtype=np.float64)
+        pt /= pt[2]   # perspective divide
         return float(pt[0]), float(pt[1])
 
     # ── Main marker detection ─────────────────────────────────────────────────
@@ -229,6 +236,7 @@ class Tracker:
                 mid = ids[i][0]
                 if mid in self.Corners:
                     self.Corners[mid] = corners[i]
+                    self.lastSeen[mid] = time.time()   # record fresh detection
 
         if self.originFound or len(self.Corners[10]) != 0:
             if not self.originFound:
@@ -248,7 +256,7 @@ class Tracker:
 
                     raw_x, raw_y = float(position[0]), float(position[1])
                     if self.spatialCalibDone:
-                        cal_x, cal_y = self._applyAffine(raw_x, raw_y)
+                        cal_x, cal_y = self._applyHomography(raw_x, raw_y)
                     else:
                         cal_x, cal_y = raw_x, raw_y
 
@@ -300,6 +308,45 @@ class Tracker:
         calib_color = (0, 255, 0) if self.spatialCalibDone else (0, 165, 255)
         cv2.putText(frame, calib_text, (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, calib_color, 2)
+        
+
+        # ── Draw virtual boundary rectangles on frame ─────────────────────
+        if self.originFound:
+            # Boundary constants (metres) — match RUNME3.ino
+            X_MIN, X_MAX   = -1.68,  1.63
+            Y_MIN, Y_MAX   = -0.88,  0.865
+            SOFT_MARGIN    =  0.45   # repulsion starts here (larger rectangle)
+            HARD_MARGIN    =  0.10   # hard limit / recovery zone (smaller rectangle)
+
+            def world_to_pixel(wx, wy):
+                world_pt = np.array([wx, wy, 0.0])
+                cam_pt   = np.matmul(self.rodrigues.T, world_pt) + self.originT[0][0]
+                px, _    = cv2.projectPoints(
+                    cam_pt.reshape(1, 1, 3),
+                    np.zeros(3), np.zeros(3),
+                    self.mtx, self.dist)
+                return (int(px[0][0][0]), int(px[0][0][1]))
+
+            def draw_boundary_rect(x_min, x_max, y_min, y_max, color, thickness):
+                tl = world_to_pixel(x_min, y_max)
+                tr = world_to_pixel(x_max, y_max)
+                br = world_to_pixel(x_max, y_min)
+                bl = world_to_pixel(x_min, y_min)
+                pts = np.array([tl, tr, br, bl], dtype=np.int32)
+                cv2.polylines(frame, [pts], isClosed=True,
+                              color=color, thickness=thickness)
+
+            # Green — soft zone boundary, robot starts turning inside here
+            draw_boundary_rect(
+                X_MIN + SOFT_MARGIN, X_MAX - SOFT_MARGIN,
+                Y_MIN + SOFT_MARGIN, Y_MAX - SOFT_MARGIN,
+                color=(0, 255, 0), thickness=1)
+
+            # Red — hard limit, robot should never cross this line
+            draw_boundary_rect(
+                X_MIN + HARD_MARGIN, X_MAX - HARD_MARGIN,
+                Y_MIN + HARD_MARGIN, Y_MAX - HARD_MARGIN,
+                color=(0, 0, 255), thickness=2)
 
         return frame
 
@@ -341,6 +388,16 @@ class Tracker:
         self.vs.stop()
         self.vs.stream.release()
         cv2.destroyAllWindows()
+
+    def clearStoppedRobot(self, robot_id: int):
+        """
+        Called by move.py at the start of every 'go' command to reset the
+        safety state for a robot so it isn't immediately re-stopped from a
+        previous lost-marker event. Also clears lastSeen so the timeout
+        doesn't fire until the marker has been seen again in a fresh frame.
+        """
+        self._safety_clear.add(robot_id)
+        self.lastSeen.pop(10 + robot_id, None)
 
     # ── Worker threads ────────────────────────────────────────────────────────
 
@@ -434,8 +491,8 @@ class Tracker:
         robots (IDs 11-16) and the obstacle (ID 18) if visible — against
         WARN_DISTANCE and STOP_DISTANCE.
 
-        On a STOP event both markers involved have their agentGo cut to 0.
-        For the obstacle (which has no agentGo of its own) only the robot
+        On a STOP event both markers involved have agentStop set to 1.
+        For the obstacle (which has no agentStop of its own) only the robot
         in the pair gets stopped. Once both markers in a pair move back out
         of range the pair is cleared so they can be re-sent.
         """
@@ -446,11 +503,52 @@ class Tracker:
         # Set of robot IDs currently held stopped
         stopped_robots: set = set()
 
+        missed_frames = {}   # {robot_id: int} consecutive ticks without detection
+
         while not self.Stop:
             time.sleep(0.1)
 
+            now = time.time()
+
+            # Unblock any robots that move.py has explicitly re-armed
+            if self._safety_clear:
+                stopped_robots -= self._safety_clear
+                for rid in self._safety_clear:
+                    missed_frames.pop(rid, None)
+                self._safety_clear.clear()
+
+            # ── Lost-marker check ─────────────────────────────────────────────
+            # Count consecutive ticks where the marker wasn't seen. Only fire
+            # after LOST_FRAMES misses in a row to avoid false stops from a
+            # single dropped detection.
+            for i in range(1, NUM_ROBOTS + 1):
+                marker_id = 10 + i
+                last = self.lastSeen.get(marker_id, None)
+                if last is None:
+                    continue   # never seen yet, don't count
+                if (now - last) > 0.15:   # marker not seen this tick (100ms loop + buffer)
+                    missed_frames[i] = missed_frames.get(i, 0) + 1
+                else:
+                    missed_frames[i] = 0   # reset on fresh detection
+
+                if missed_frames.get(i, 0) >= self.LOST_FRAMES:
+                    if i not in stopped_robots:
+                        stopped_robots.add(i)
+                        print(
+                            f"\n{RED}[SAFETY STOP]  Robot {i} marker lost "
+                            f"({missed_frames[i]} consecutive misses) — setting stop signal!{RESET}"
+                        )
+                        try:
+                            requests.put(
+                                self.address + f"agentStop/{i}",
+                                json={"id": i, "stop": 1},
+                                timeout=1,
+                            )
+                        except Exception as e:
+                            print(f"  [SAFETY] Server unreachable: {e}")
+
             # Build the list of currently tracked markers as (label, xy, robot_id_or_None)
-            # robot_id is None for the obstacle since it has no agentGo entry
+            # robot_id is None for the obstacle since it has no agentStop entry
             tracked = []
             for i in range(1, NUM_ROBOTS + 1):
                 xy = self.pos[i][:2]
@@ -479,12 +577,12 @@ class Tracker:
                                 print(
                                     f"\n{RED}[SAFETY STOP]  {label_a} ↔ {label_b}  "
                                     f"dist={dist:.3f} m (limit={STOP_DISTANCE} m) — "
-                                    f"cutting go signal for Robot {rid}!{RESET}"
+                                    f"setting stop signal for Robot {rid}!{RESET}"
                                 )
                                 try:
                                     requests.put(
-                                        self.address + f"agentGo/{rid}",
-                                        json={"id": rid, "ready": 0},
+                                        self.address + f"agentStop/{rid}",
+                                        json={"id": rid, "stop": 1},
                                         timeout=1,
                                     )
                                 except Exception as e:

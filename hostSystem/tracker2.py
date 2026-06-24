@@ -1,17 +1,16 @@
 """
-Code authored by Keegan Kelly
-Modified: added corner-marker spatial calibration (2D affine) to correct
-distance/scale errors without relying solely on the intrinsic camera calibration.
+tracker2.py  —  pixel-based tracking, no origin/corner markers needed.
 
-SETUP:
-  1. Print 4 ArUco markers from DICT_4X4_1000 with IDs 20, 21, 22, 23.
-     Use makeMarker.py, just change the id on the cv2.aruco.generateImageMarker call.
-  2. Place them at measured real-world positions relative to the origin marker.
-     Edit CORNER_MARKER_REAL_POSITIONS below with those measurements (in metres).
-  3. Run as normal.  The script will wait until all corner markers are seen,
-     average CORNER_CALIB_SAMPLES frames for each, fit the affine transform,
-     then print the calibration error and start tracking.
-  4. Press 'c' in the video window to redo calibration without restarting.
+Coordinate system:
+  - Frame centre = (0, 0) in metres
+  - +X right, +Y up  (Y is flipped from pixel space where +Y is down)
+  - Scale: PIXELS_PER_M derived from known arena size and frame resolution
+
+Robot markers: ArUco IDs 11-16  (robot i uses ID 10+i)
+No origin marker needed. Camera just needs to be roughly overhead and centred.
+
+Press q — quit
+Press r — no-op, kept for compatibility
 """
 
 import cv2
@@ -19,328 +18,191 @@ import numpy as np
 import time
 import requests
 import os
-
-os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
-
-from ast import Pass
 from threading import Thread
 from webcamvideostream import WebcamVideoStream
 
-def clear():
-    os.system('cls' if os.name == 'nt' else 'clear')
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
 NUM_ROBOTS = 6
 
-# ---------------------------------------------------------------------------
-# CORNER MARKER CONFIGURATION
-# Edit these to match your physical setup.
-#
-# CORNER_MARKER_REAL_POSITIONS maps marker ID -> (true_x, true_y) in metres,
-# measured from the origin marker.  Use as many corners as you have (minimum 3,
-# but 4 gives a nicely overdetermined system for a more robust fit).
-#
-# Example: a 2.0 m x 1.5 m rectangle of corners around the origin:
-#   ID 20 = far-left  corner  (-1.0,  0.75)
-#   ID 21 = far-right corner  ( 1.0,  0.75)
-#   ID 22 = near-right corner ( 1.0, -0.75)
-#   ID 23 = near-left  corner (-1.0, -0.75)
-# ---------------------------------------------------------------------------
-CORNER_MARKER_REAL_POSITIONS = {
-    20: (-1.68,  0.865),
-    21: ( 1.63,  0.865),
-    22: ( 1.63, -0.88),
-    23: (-1.6775, -0.88), 
-}
+# ── Arena / camera config ─────────────────────────────────────────────────────
+FRAME_W       = 1920
+FRAME_H       = 1080
+ARENA_W_M     = 3.60          # physical arena width  in metres
+ARENA_H_M     = 2.03          # physical arena height in metres
 
-# Number of frames averaged per corner marker to reduce noise during calibration
-CORNER_CALIB_SAMPLES = 30
+PIXELS_PER_M_X = FRAME_W / ARENA_W_M
+PIXELS_PER_M_Y = FRAME_H / ARENA_H_M
+
+CX = FRAME_W // 2
+CY = FRAME_H // 2
+
+# ── Boundary display constants (pixels from frame edge) ──────────────────────
+SOFT_PX = 100
+HARD_PX = 50
+
+# ── Safety thresholds (metres) ────────────────────────────────────────────────
+WARN_DISTANCE = 0.5
+STOP_DISTANCE = 0.3
+
+
+def pixel_to_metres(px, py):
+    x_m =  (px - CX) / PIXELS_PER_M_X
+    y_m = -(py - CY) / PIXELS_PER_M_Y
+    return x_m, y_m
+
+
+def metres_to_pixel(x_m, y_m):
+    px = int( x_m * PIXELS_PER_M_X + CX)
+    py = int(-y_m * PIXELS_PER_M_Y + CY)
+    return px, py
+
+
+def marker_heading(corners):
+    c = corners[0]
+    right_mid = (c[1] + c[2]) / 2.0
+    left_mid  = (c[0] + c[3]) / 2.0
+    dx =  (right_mid[0] - left_mid[0]) / PIXELS_PER_M_X
+    dy = -(right_mid[1] - left_mid[1]) / PIXELS_PER_M_Y
+    angle = np.arctan2(dy, dx) + np.pi / 2
+    while angle >  np.pi: angle -= 2 * np.pi
+    while angle < -np.pi: angle += 2 * np.pi
+    return angle
 
 
 class Tracker:
-    # importing the camera matrix and distortion coefficients
-    npfile = np.load("calibration.npz")
-    mtx = npfile["mtx"]
-    dist = npfile["dist"]
 
-    # Corners dict now also holds the corner calibration marker IDs
-    Corners = {10: tuple(), 11: tuple(), 12: tuple(), 13: tuple(),
-               14: tuple(), 15: tuple(), 16: tuple(),
-               20: tuple(), 21: tuple(), 22: tuple(), 23: tuple()}
-
-    NUMMARKERS = 1 + NUM_ROBOTS
-
-    # positions of each marker (robots only, indices 1..NUM_ROBOTS)
-    pos = np.zeros((NUMMARKERS, 3))
-    pos[0] = [0, 0, np.pi/2]
-
-    originFound = False
-
-    # Affine calibration state
-    # affineM is a 2x3 matrix applied as:  corrected_xy = affineM @ [raw_x, raw_y, 1]
-    # Initialised to identity so tracking still works before calibration runs.
-    affineM = np.array([[1.0, 0.0, 0.0],
-                        [0.0, 1.0, 0.0]])
-    spatialCalibDone = False
+    try:
+        npfile = np.load("calibration.npz")
+        mtx  = npfile["mtx"]
+        dist = npfile["dist"]
+    except Exception:
+        mtx  = np.eye(3)
+        dist = np.zeros(5)
 
     ARUCO_DICT = {
-        "DICT_4X4_50": cv2.aruco.DICT_4X4_50,
-        "DICT_4X4_100": cv2.aruco.DICT_4X4_100,
-        "DICT_4X4_250": cv2.aruco.DICT_4X4_250,
-        "DICT_4X4_1000": cv2.aruco.DICT_4X4_1000,
-        "DICT_5X5_50": cv2.aruco.DICT_5X5_50,
-        "DICT_5X5_100": cv2.aruco.DICT_5X5_100,
-        "DICT_5X5_250": cv2.aruco.DICT_5X5_250,
-        "DICT_5X5_1000": cv2.aruco.DICT_5X5_1000,
-        "DICT_6X6_50": cv2.aruco.DICT_6X6_50,
-        "DICT_6X6_100": cv2.aruco.DICT_6X6_100,
-        "DICT_6X6_250": cv2.aruco.DICT_6X6_250,
-        "DICT_6X6_1000": cv2.aruco.DICT_6X6_1000,
-        "DICT_7X7_50": cv2.aruco.DICT_7X7_50,
-        "DICT_7X7_100": cv2.aruco.DICT_7X7_100,
-        "DICT_7X7_250": cv2.aruco.DICT_7X7_250,
-        "DICT_7X7_1000": cv2.aruco.DICT_7X7_1000,
+        "DICT_4X4_50":         cv2.aruco.DICT_4X4_50,
+        "DICT_4X4_100":        cv2.aruco.DICT_4X4_100,
+        "DICT_4X4_250":        cv2.aruco.DICT_4X4_250,
+        "DICT_4X4_1000":       cv2.aruco.DICT_4X4_1000,
+        "DICT_5X5_50":         cv2.aruco.DICT_5X5_50,
+        "DICT_5X5_100":        cv2.aruco.DICT_5X5_100,
+        "DICT_5X5_250":        cv2.aruco.DICT_5X5_250,
+        "DICT_5X5_1000":       cv2.aruco.DICT_5X5_1000,
+        "DICT_6X6_50":         cv2.aruco.DICT_6X6_50,
+        "DICT_6X6_100":        cv2.aruco.DICT_6X6_100,
+        "DICT_6X6_250":        cv2.aruco.DICT_6X6_250,
+        "DICT_6X6_1000":       cv2.aruco.DICT_6X6_1000,
+        "DICT_7X7_50":         cv2.aruco.DICT_7X7_50,
+        "DICT_7X7_100":        cv2.aruco.DICT_7X7_100,
+        "DICT_7X7_250":        cv2.aruco.DICT_7X7_250,
+        "DICT_7X7_1000":       cv2.aruco.DICT_7X7_1000,
         "DICT_ARUCO_ORIGINAL": cv2.aruco.DICT_ARUCO_ORIGINAL,
-        "DICT_APRILTAG_16h5": cv2.aruco.DICT_APRILTAG_16h5,
-        "DICT_APRILTAG_25h9": cv2.aruco.DICT_APRILTAG_25h9,
+        "DICT_APRILTAG_16h5":  cv2.aruco.DICT_APRILTAG_16h5,
+        "DICT_APRILTAG_25h9":  cv2.aruco.DICT_APRILTAG_25h9,
         "DICT_APRILTAG_36h10": cv2.aruco.DICT_APRILTAG_36h10,
-        "DICT_APRILTAG_36h11": cv2.aruco.DICT_APRILTAG_36h11
+        "DICT_APRILTAG_36h11": cv2.aruco.DICT_APRILTAG_36h11,
     }
 
-    def __init__(self, marker_width, aruco_type, address, fps=60, wideAngle=False):
-        self.markerWidth = marker_width
-        self.arucoDict = cv2.aruco.getPredefinedDictionary(self.ARUCO_DICT[aruco_type])
-        self.arucoParams = cv2.aruco.DetectorParameters()
-        self.arucoDetector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
-        self.startTime = time.perf_counter()
-        self.address = address
-        self.frameRate = fps
-        self.wideAngle = wideAngle
-        if self.wideAngle:
-            npfile = np.load("wideAngleCalibration.npz")
-            self.mtx = npfile["mtx"]
-            self.dist = npfile["dist"]
-        # Accumulator for corner marker samples during spatial calibration
-        # { marker_id: list of (raw_x, raw_y) observations }
-        self._cornerSamples = {mid: [] for mid in CORNER_MARKER_REAL_POSITIONS}
-        self._recalibrateFlag = False
+    def __init__(self, marker_width, aruco_type, address, fps=30, wideAngle=False):
+        self.markerWidth   = marker_width
+        self.arucoDict     = cv2.aruco.getPredefinedDictionary(self.ARUCO_DICT[aruco_type])
+        self.arucoParams   = cv2.aruco.DetectorParameters()
+        self.address       = address
+        self.frameRate     = fps
+        self.wideAngle     = wideAngle
+        self._safety_clear = set()
 
-    # ------------------------------------------------------------------
-    # Angle utilities
-    # ------------------------------------------------------------------
+        # Per-instance state (not class-level to avoid sharing between instances)
+        self.pos      = np.zeros((1 + NUM_ROBOTS, 3))
+        self.Corners  = {11: tuple(), 12: tuple(), 13: tuple(),
+                         14: tuple(), 15: tuple(), 16: tuple()}
+        self.lastSeen = {}
+        self.Stop     = False
+        self.out_frame = None
 
-    def fixAngle(self, angle):
-        while angle > np.pi:
-            angle -= 2 * np.pi
-        while angle < -np.pi:
-            angle += 2 * np.pi
-        return angle
+        self._t_prev = time.perf_counter()
 
-    # ------------------------------------------------------------------
-    # Spatial calibration
-    # ------------------------------------------------------------------
-
-    def _getRawPosition(self, marker_id):
-        """Return the raw (uncorrected) (x, y) of a marker relative to the
-        origin, or None if the marker hasn't been seen yet."""
-        corners = self.Corners.get(marker_id)
-        if corners is None or len(corners) == 0:
-            return None
-        rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners, self.markerWidth, self.mtx, self.dist)
-        position = np.matmul(self.rodrigues, tvec[0][0] - self.originT[0][0])
-        return float(position[0]), float(position[1])
-
-    def runSpatialCalibration(self):
-        """Block until all corner markers have been observed CORNER_CALIB_SAMPLES
-        times, then fit a 2D affine transform and store it in self.affineM.
-        Designed to be called from a thread after the origin is found."""
-
-        print("\n[SpatialCalib] Waiting for origin marker...")
-        while not self.originFound:
-            time.sleep(0.1)
-
-        print(f"[SpatialCalib] Origin found. Collecting {CORNER_CALIB_SAMPLES} "
-              f"samples for each of {list(CORNER_MARKER_REAL_POSITIONS.keys())}...")
-
-        # Reset accumulators
-        self._cornerSamples = {mid: [] for mid in CORNER_MARKER_REAL_POSITIONS}
-
-        while True:
-            # Collect one observation per corner marker per iteration
-            all_done = True
-            status_parts = []
-            for mid in CORNER_MARKER_REAL_POSITIONS:
-                samples = self._cornerSamples[mid]
-                n = len(samples)
-                if n < CORNER_CALIB_SAMPLES:
-                    all_done = False
-                    raw = self._getRawPosition(mid)
-                    if raw is not None:
-                        samples.append(raw)
-                status_parts.append(f"ID{mid}:{len(self._cornerSamples[mid])}/{CORNER_CALIB_SAMPLES}")
-            print("\r[SpatialCalib] " + "  ".join(status_parts), end="", flush=True)
-            if all_done:
-                break
-            time.sleep(1.0 / self.frameRate)
-
-        print("\n[SpatialCalib] Fitting affine transform...")
-
-        # Average the samples for each marker to get a stable raw estimate
-        raw_pts  = []   # observed (x, y) from tracker
-        true_pts = []   # known real-world (x, y)
-        for mid, true_xy in CORNER_MARKER_REAL_POSITIONS.items():
-            samples = self._cornerSamples[mid]
-            avg_x = np.mean([s[0] for s in samples])
-            avg_y = np.mean([s[1] for s in samples])
-            raw_pts.append([avg_x, avg_y])
-            true_pts.append(list(true_xy))
-            print(f"  Marker {mid}: raw avg=({avg_x:.4f}, {avg_y:.4f})  "
-                  f"true=({true_xy[0]:.4f}, {true_xy[1]:.4f})")
-
-        raw_pts  = np.array(raw_pts,  dtype=np.float64)   # shape (N, 2)
-        true_pts = np.array(true_pts, dtype=np.float64)   # shape (N, 2)
-
-        # Build the least-squares system for a 2x3 affine matrix M such that
-        #   true_pt ≈ M @ [raw_x, raw_y, 1]^T
-        # Expanded per coordinate:
-        #   true_x = a*raw_x + b*raw_y + c
-        #   true_y = d*raw_x + e*raw_y + f
-        # We solve each row independently.
-        N = len(raw_pts)
-        A = np.hstack([raw_pts, np.ones((N, 1))])   # (N, 3)
-
-        # Solve for x-row and y-row of the affine matrix
-        row_x, _, _, _ = np.linalg.lstsq(A, true_pts[:, 0], rcond=None)
-        row_y, _, _, _ = np.linalg.lstsq(A, true_pts[:, 1], rcond=None)
-
-        M = np.array([row_x, row_y])   # 2x3
-
-        # Report reprojection error on the calibration markers
-        errors = []
-        for i in range(N):
-            pred = M @ np.array([raw_pts[i, 0], raw_pts[i, 1], 1.0])
-            err  = np.linalg.norm(pred - true_pts[i])
-            errors.append(err)
-        mean_err = np.mean(errors)
-        max_err  = np.max(errors)
-        print(f"[SpatialCalib] Done.  Mean reprojection error: {mean_err*100:.2f} cm  "
-              f"Max: {max_err*100:.2f} cm")
-        print(f"[SpatialCalib] Affine matrix:\n{M}")
-
-        self.affineM = M
-        self.spatialCalibDone = True
-        self._recalibrateFlag = False
-
-    def _applyAffine(self, x, y):
-        """Apply the calibration affine transform to a raw (x, y) position."""
-        pt = self.affineM @ np.array([x, y, 1.0])
-        return float(pt[0]), float(pt[1])
-
-    # ------------------------------------------------------------------
-    # Main marker detection
-    # ------------------------------------------------------------------
+    # ── Frame processing ──────────────────────────────────────────────────────
 
     def find_markerPos(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        (corners, ids, rejectedImgPoints) = cv2.aruco.detectMarkers(
+        corners, ids, _ = cv2.aruco.detectMarkers(
             gray, self.arucoDict, parameters=self.arucoParams)
 
-        if len(corners) > 0:
-            ids.flatten()
-            for i in range(len(ids)):
-                mid = ids[i][0]
+        if ids is not None and len(corners) > 0:
+            for i, mid in enumerate(ids.flatten()):
                 if mid in self.Corners:
-                    self.Corners[mid] = corners[i]
+                    self.Corners[mid]  = corners[i]
+                    self.lastSeen[mid] = time.time()
 
-        if self.originFound or len(self.Corners[10]) != 0:
-            if not self.originFound:
-                self.originR, self.originT, _ = cv2.aruco.estimatePoseSingleMarkers(
-                    self.Corners[10], self.markerWidth, self.mtx, self.dist)
-                self.rodrigues = cv2.Rodrigues(self.originR[0][0])[0]
-                self.originFound = True
+        for i in range(1, NUM_ROBOTS + 1):
+            mid = 10 + i
+            c   = self.Corners.get(mid)
+            if c is not None and len(c) > 0:
+                px_c = float(np.mean(c[0][:, 0]))
+                py_c = float(np.mean(c[0][:, 1]))
+                x_m, y_m = pixel_to_metres(px_c, py_c)
+                theta     = marker_heading(c)
+                self.pos[i] = [x_m, y_m, theta]
 
-            # Robot markers
-            for i in range(1, self.NUMMARKERS):
-                if len(self.Corners[10 + i]) != 0:
-                    rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
-                        self.Corners[i + 10], self.markerWidth, self.mtx, self.dist)
-                    position = np.matmul(self.rodrigues, tvec[0][0] - self.originT[0][0])
-                    Rod = cv2.Rodrigues(rvec[0][0])[0]
-                    heading = cv2.Rodrigues(np.matmul(self.rodrigues, Rod))[0][2] + np.pi / 2
+                px_i, py_i = int(px_c), int(py_c)
+                cv2.drawMarker(frame, (px_i, py_i), (0, 255, 0),
+                               cv2.MARKER_CROSS, 20, 2)
+                cv2.putText(frame, f"R{i}  ({x_m:.2f},{y_m:.2f})",
+                            (px_i + 12, py_i - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-                    raw_x, raw_y = float(position[0]), float(position[1])
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
-                    # Apply spatial calibration transform if available
-                    if self.spatialCalibDone:
-                        cal_x, cal_y = self._applyAffine(raw_x, raw_y)
-                    else:
-                        cal_x, cal_y = raw_x, raw_y
+        # FPS
+        now = time.perf_counter()
+        dt  = now - self._t_prev
+        self._t_prev = now
+        if dt > 0:
+            cv2.putText(frame, f"FPS: {1/dt:.1f}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                    self.pos[i] = [cal_x, cal_y, self.fixAngle(heading)[0]]
-                    cv2.drawFrameAxes(frame, self.mtx, self.dist, Rod, tvec, self.markerWidth)
+        # Boundary rectangles
+        cv2.rectangle(frame, (SOFT_PX, SOFT_PX),
+                      (FRAME_W - SOFT_PX, FRAME_H - SOFT_PX), (0, 255, 0), 1)
+        cv2.rectangle(frame, (HARD_PX, HARD_PX),
+                      (FRAME_W - HARD_PX, FRAME_H - HARD_PX), (0, 0, 255), 2)
 
-            # Draw corner calibration markers if they are visible
-            #for mid in CORNER_MARKER_REAL_POSITIONS:
-            #    if len(self.Corners[mid]) != 0:
-            #        rvec_c, tvec_c, _ = cv2.aruco.estimatePoseSingleMarkers(
-            #            self.Corners[mid], self.markerWidth, self.mtx, self.dist)
-            #        cv2.drawFrameAxes(frame, self.mtx, self.dist,
-            #                          cv2.Rodrigues(self.rodrigues)[0],
-            #                          tvec_c, self.markerWidth * 2)
-
-        if self.originFound:
-            cv2.drawFrameAxes(frame, self.mtx, self.dist,
-                              self.rodrigues, self.originT[0][0], self.markerWidth * 5)
-
-        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-
-        # FPS counter
-        self.endTime = time.perf_counter()
-        dt = self.endTime - self.startTime
-        self.startTime = self.endTime
-        if dt != 0:
-            cv2.putText(frame, "FPS: " + format(1 / dt, '.2f'),
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        # Calibration status overlay
-        calib_text = "Spatial calib: OK" if self.spatialCalibDone else "Spatial calib: PENDING (need corner markers)"
-        calib_color = (0, 255, 0) if self.spatialCalibDone else (0, 165, 255)
-        cv2.putText(frame, calib_text, (10, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, calib_color, 2)
-
-        ##LINE_CLEAR = '\x1b[2K'
-        ##printPositions = ""
-        ##for i in range(1, NUM_ROBOTS + 1):
-        ##    printPositions += ("(" + format(self.pos[i][0], '.3f') + ", "
-        ##                        + format(self.pos[i][1], '.3f') + ", "
-        ##                       + format(self.pos[i][2], '.2f') + ")")
-        ##print(LINE_UP + LINE_CLEAR + printPositions)
+        # Centre lines and origin
+        cv2.line(frame, (CX, 0), (CX, FRAME_H), (0, 255, 255), 1)
+        cv2.line(frame, (0, CY), (FRAME_W, CY), (0, 255, 255), 1)
+        cv2.drawMarker(frame, (CX, CY), (0, 0, 255), cv2.MARKER_CROSS, 40, 2)
+        cv2.putText(frame, "(0,0)", (CX + 10, CY - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         return frame
 
-    # ------------------------------------------------------------------
-    # Thread management  (unchanged except for the new calibration thread)
-    # ------------------------------------------------------------------
+    # ── Thread management ─────────────────────────────────────────────────────
 
     def startThreads(self, check_ready=True):
         self.Stop = False
-        self.runGetFrame(frameRate=self.frameRate)
-        t2 = Thread(target=self.runProcessFrame)
-        t2.daemon = False
-        t2.start()
-        t3 = Thread(target=self.runShowFrame)
-        t3.daemon = False
-        t3.start()
-        t1 = Thread(target=self.runPutThread)
-        t1.daemon = False
-        t1.start()
+
+        # Start camera — wait until first frame is ready before launching threads
+        Focus = 20 if self.wideAngle else 0
+        self.vs = WebcamVideoStream(
+            src=1, fps=self.frameRate, focus=Focus,
+            width=FRAME_W, height=FRAME_H).start()
+
+        # Block until camera delivers a real frame
+        while not self.vs.grabbed or self.vs.frame is None:
+            time.sleep(0.05)
+        self.out_frame = self.vs.frame.copy()
+
+        Thread(target=self._process_loop, daemon=False).start()
+        
+        Thread(target=self._put_loop,     daemon=False).start()
+        Thread(target=self.checkSafety,   daemon=True ).start()
+
         if check_ready:
-            t4 = Thread(target=self.checkReady)
-            t4.daemon = False
-            t4.start()
-        t5 = Thread(target=self.runSpatialCalibration)
-        t5.daemon = True
-        t5.start()
+            Thread(target=self.checkReady, daemon=False).start()
+
         return self
 
     def stopThread(self):
@@ -349,76 +211,136 @@ class Tracker:
         self.vs.stream.release()
         cv2.destroyAllWindows()
 
-    def runPutThread(self):
-        prevTime = time.time()
-        WINDOW = 5  # number of frames to average — higher = smoother but more lag
-        posHistory = [np.zeros((NUM_ROBOTS, 3)) for _ in range(WINDOW)]
+    def clearStoppedRobot(self, robot_id: int):
+        self._safety_clear.add(robot_id)
+        self.lastSeen.pop(10 + robot_id, None)
+
+    # ── Worker threads ────────────────────────────────────────────────────────
+
+    def _process_loop(self):
         while not self.Stop:
-            if (time.time() - prevTime) > 0.05:
-                prevTime = time.time()
-                # add latest reading to history, drop oldest
-                posHistory.append(self.pos[1:].copy())
-                posHistory.pop(0)
-                # average across the window
-                smoothedPos = np.mean(posHistory, axis=0)
-                data = {"id": 1, "pos": smoothedPos.tolist()}
-                requests.put(self.address + "allPos/1", json=data)
-
-    def runProcessFrame(self):
-        while True:
-            if self.Stop:
-                return
             if self.vs.grabbed:
-                self.outFrame = self.find_markerPos(self.vs.frame)
+                self.out_frame = self.find_markerPos(self.vs.frame.copy())
 
-    def runGetFrame(self, frameRate):
-        Focus = 20 if self.wideAngle else 0
-        self.vs = WebcamVideoStream(src=1, fps=frameRate, focus=Focus).start()
-        self.vs.start()
-        self.outFrame = self.vs.frame
-
-    def runShowFrame(self):
-        prevTime = time.time()
-        frameDelta = 1 / self.frameRate
-        while True:
-            if self.Stop:
-                return
-            if self.vs.grabbed:
-                prevTime = time.time()
-                cv2.imshow('frame', self.outFrame)
+    def _display_loop(self):
+        frame_delta = 1.0 / self.frameRate
+        cv2.namedWindow('frame', cv2.WINDOW_NORMAL)
+        while not self.Stop:
+            prev = time.time()
+            if self.out_frame is not None:
+                cv2.imshow('frame', self.out_frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 self.stopThread()
                 break
-            if key == ord('r'):
-                self.originFound = False
-            # 'c' triggers a fresh spatial calibration
-            if key == ord('c'):
-                self.spatialCalibDone = False
-                t = Thread(target=self.runSpatialCalibration)
-                t.daemon = True
-                t.start()
-            sleepTime = frameDelta - (time.time() - prevTime)
-            time.sleep(sleepTime * (sleepTime > 0))
-        return self
+            sleep = frame_delta - (time.time() - prev)
+            time.sleep(max(0.0, sleep))
+
+    def _put_loop(self):
+        WINDOW     = 5
+        posHistory = [np.zeros((NUM_ROBOTS, 3)) for _ in range(WINDOW)]
+        prev       = time.time()
+        while not self.Stop:
+            if (time.time() - prev) > 0.05:
+                prev = time.time()
+                posHistory.append(self.pos[1:].copy())
+                posHistory.pop(0)
+                smoothed = np.mean(posHistory, axis=0)
+                data = {"id": 1, "pos": smoothed.tolist()}
+                try:
+                    requests.put(self.address + "allPos/1", json=data, timeout=0.1)
+                except requests.exceptions.RequestException:
+                    pass
 
     def checkReady(self):
-        prevTime = time.time()
+        prev      = time.time()
         connected = set()
         while True:
-            if (time.time() - prevTime) > 2:
-                prevTime = time.time()
-                req = requests.get(self.address + "agentReady")
-                DATA = req.json()
-                SUM = 0
+            if (time.time() - prev) > 2:
+                prev = time.time()
+                try:
+                    req  = requests.get(self.address + "agentReady", timeout=1)
+                    DATA = req.json()
+                except Exception:
+                    continue
+                total = 0
                 for i in range(NUM_ROBOTS):
-                    SUM += DATA[i]["ready"]
+                    total += DATA[i]["ready"]
                     if DATA[i]["ready"] == 1 and i not in connected:
                         connected.add(i)
                         print(f"Robot {i+1} connected!")
-                if SUM == NUM_ROBOTS:
+                if total == NUM_ROBOTS:
                     print("All robots connected! Starting...")
                     for i in range(NUM_ROBOTS):
-                        requests.put(self.address + "agentGo/" + str(int(i + 1)),
+                        requests.put(self.address + "agentGo/" + str(i + 1),
                                      json={'id': i + 1, 'ready': 1})
                     break
+
+    def checkSafety(self):
+        RESET  = "\033[0m"
+        YELLOW = "\033[93m"
+        RED    = "\033[91m"
+        stopped_robots = set()
+        missed_frames  = {}
+
+        while not self.Stop:
+            time.sleep(0.1)
+            now = time.time()
+
+            if self._safety_clear:
+                stopped_robots -= self._safety_clear
+                for rid in self._safety_clear:
+                    missed_frames.pop(rid, None)
+                self._safety_clear.clear()
+
+            # Lost marker check
+            for i in range(1, NUM_ROBOTS + 1):
+                marker_id = 10 + i
+                last = self.lastSeen.get(marker_id)
+                if last is None:
+                    continue
+                if (now - last) > 0.15:
+                    missed_frames[i] = missed_frames.get(i, 0) + 1
+                else:
+                    missed_frames[i] = 0
+                if missed_frames.get(i, 0) >= 5:
+                    if i not in stopped_robots:
+                        stopped_robots.add(i)
+                        print(f"\n{RED}[SAFETY STOP] Robot {i} marker lost — stop!{RESET}")
+                        try:
+                            requests.put(self.address + f"agentStop/{i}",
+                                         json={"id": i, "stop": 1}, timeout=1)
+                        except Exception as e:
+                            print(f"  [SAFETY] Server unreachable: {e}")
+
+            # Proximity check
+            tracked = []
+            for i in range(1, NUM_ROBOTS + 1):
+                xy = self.pos[i][:2]
+                if not np.allclose(xy, [0.0, 0.0]):
+                    tracked.append((f"Robot {i}", np.array(xy), i))
+
+            currently_stopped = set()
+            for a in range(len(tracked)):
+                for b in range(a + 1, len(tracked)):
+                    label_a, xy_a, rid_a = tracked[a]
+                    label_b, xy_b, rid_b = tracked[b]
+                    dist = float(np.linalg.norm(xy_a - xy_b))
+                    if dist <= STOP_DISTANCE:
+                        pair_robots = {rid_a, rid_b}
+                        currently_stopped |= pair_robots
+                        for rid in pair_robots:
+                            if rid not in stopped_robots:
+                                stopped_robots.add(rid)
+                                print(f"\n{RED}[SAFETY STOP] {label_a} <-> {label_b} "
+                                      f"dist={dist:.3f}m — stop Robot {rid}!{RESET}")
+                                try:
+                                    requests.put(self.address + f"agentStop/{rid}",
+                                                 json={"id": rid, "stop": 1}, timeout=1)
+                                except Exception as e:
+                                    print(f"  [SAFETY] Server unreachable: {e}")
+                    elif dist <= WARN_DISTANCE:
+                        print(f"{YELLOW}[SAFETY WARN] {label_a} <-> {label_b} "
+                              f"dist={dist:.3f}m{RESET}", end="\r")
+
+            stopped_robots &= currently_stopped

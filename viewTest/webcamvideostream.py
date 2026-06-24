@@ -1,9 +1,9 @@
-# this is a modified version of the original code from: imutils.video.WebcamVideoStream
-# import the necessary packages
+# Modified version of imutils.video.WebcamVideoStream
 from threading import Thread
 import cv2
 import time
 import platform
+
 
 class WebcamVideoStream:
     def __init__(self, src=1, name="WebcamVideoStream", height=1080, width=1920, fps=30, focus=0):
@@ -26,30 +26,23 @@ class WebcamVideoStream:
         (self.grabbed, self.frame) = self.stream.read()
 
     def start(self):
-        # start the thread to read frames from the video stream
         t = Thread(target=self.update, name=self.name, args=())
         t.daemon = True
         t.start()
         return self
 
     def update(self):
-        frameDelta = 1/self.fps
-        # keep looping infinitely until the thread is stopped
+        frameDelta = 1 / self.fps
         while True:
-            # if the thread indicator variable is set, stop the thread
             if self.stopped:
                 return
-
             prevTime = time.time()
-            # otherwise, read the next frame from the stream
             (self.grabbed, self.frame) = self.stream.read()
             sleepTime = frameDelta - (time.time() - prevTime)
-            time.sleep(sleepTime*(sleepTime > 0))
+            time.sleep(sleepTime * (sleepTime > 0))
 
     def read(self):
-        # return the frame most recently read
         return self.frame
 
     def stop(self):
-        # indicate that the thread should be stopped
         self.stopped = True

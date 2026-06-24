@@ -1,6 +1,6 @@
 /*
 Code Authored by Keegan Kelly
-Modified 2025: added checkStop() — polls agentGo during moveTo so the
+Modified 2025: added checkStop() — polls agentStop during moveTo so the
 obstacle safety system can halt the robot mid-movement.
 */
 #include <math.h>
@@ -92,8 +92,8 @@ public:
         int currentTime;
         float directionalErr;
 
-        // How often to poll agentGo for a stop signal (microseconds).
-        // 200 ms is responsive enough for safety without disrupting the PID loop.
+        // How often to poll agentStop for a safety-stop signal (microseconds).
+        // 200 ms is responsive enough for safety without flooding the ESP.
         const unsigned long STOP_CHECK_INTERVAL_US = 200000UL;
         unsigned long lastStopCheck = micros();
 
@@ -351,14 +351,15 @@ public:
         }
     }
 
-    // Polls agentGo and returns 1 if the server has cleared the go signal
-    // (ready == 0), meaning the robot should stop immediately.
-    // Called inside moveTo every 200 ms so it doesn't disrupt PID timing.
+    // Polls agentStop and returns 1 if the safety system has set stop=1,
+    // meaning the robot should halt immediately.
+    // Uses a dedicated endpoint so it never races with the agentGo start signal.
+    // Called inside moveTo every 200 ms.
     int checkStop()
     {
         char address[40];
         strcpy(address, serverAddress);
-        strcat(address, "/agentGo/");
+        strcat(address, "/agentStop/");
         char tempChar[2] = {id + '0', '\0'};
         strcat(address, tempChar);
         StaticJsonDocument<80> req;
@@ -375,15 +376,15 @@ public:
                 {
                     return 0;   // parse error — assume safe to continue
                 }
-                else if (req["ready"] == 0)
+                else if (req["stop"] == 1)
                 {
                     req.clear();
-                    return 1;   // go signal is cleared — stop
+                    return 1;   // safety stop triggered
                 }
                 else
                 {
                     req.clear();
-                    return 0;   // still go
+                    return 0;   // clear to move
                 }
             }
         }

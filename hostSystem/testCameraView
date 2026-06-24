@@ -1,0 +1,28 @@
+# test_tracker_display.py
+
+import cv2
+from tracker2 import Tracker
+
+tracker = Tracker(
+    marker_width=0.05,
+    aruco_type="DICT_4X4_50",
+    address="http://localhost/",
+    fps=30
+)
+
+tracker.runGetFrame(frameRate=30)
+
+while True:
+    if tracker.vs.grabbed:
+        frame = tracker.find_markerPos(tracker.vs.frame.copy())
+
+        h, w = frame.shape[:2]
+        print(f"\rFrame size: {w}x{h}", end="")
+
+        cv2.imshow("Tracker Output", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+tracker.vs.stop()
+cv2.destroyAllWindows()
