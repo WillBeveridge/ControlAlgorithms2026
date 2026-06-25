@@ -19,8 +19,8 @@
 #include <WiFiUdp.h>
 
 // ── Network Config ────────────────────────────────────────────────────────────
-const char* WIFI_SSID     = "YourNetworkSSID";
-const char* WIFI_PASSWORD = "YourNetworkPassword";
+const char* WIFI_SSID     = "RobotWifi";
+const char* WIFI_PASSWORD = "12345678";
 
 const uint16_t UDP_PORT    = 5005;
 const uint8_t  MY_ROBOT_ID = 1;
