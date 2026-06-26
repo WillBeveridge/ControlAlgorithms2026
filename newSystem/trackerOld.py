@@ -21,36 +21,18 @@ FPS               = 30
 
 # Physical dimensions of the area visible to the camera (metres).
 # Measure the floor region that fills the camera frame at the mounted height.
-SCENE_WIDTH_M     = 3.6        # Real-world width  the camera sees (metres)
-SCENE_HEIGHT_M    = 2.03       # Real-world height the camera sees (metres)
+SCENE_WIDTH_M     = 3.60        # Real-world width  the camera sees (metres)
+SCENE_HEIGHT_M    = 2.03      # Real-world height the camera sees (metres)
 #   Pixel → metre scale factors
 PX_PER_M_X = FRAME_WIDTH  / SCENE_WIDTH_M    # pixels per metre (horizontal)
 PX_PER_M_Y = FRAME_HEIGHT / SCENE_HEIGHT_M   # pixels per metre (vertical)
 
 # ArUco marker side length in metres (used for pose estimation).
-MARKER_LENGTH_M   = 0.05       # 5 cm markers
+MARKER_LENGTH_M   = 0.16       # 5 cm markers
 
 # Centre pixel (maps to world origin (0, 0))
 CX = FRAME_WIDTH  // 2         # 960
 CY = FRAME_HEIGHT // 2         # 540
-
-# ── Focus ─────────────────────────────────────────────────────────────────────
-# Manual focus — autofocus hunts on a static overhead scene.
-# 0 = infinity. Increase in steps of 10 if image looks soft at your height.
-CAMERA_FOCUS      = 10         # tune this with find_focus.py
-
-# ── Exposure ──────────────────────────────────────────────────────────────────
-# Hardcoded so the image is identical every session regardless of what the
-# camera's auto-exposure thinks. Run find_exposure.py to find your value,
-# then set it here. Typical range for indoor overhead is -4 to -8.
-# More negative = darker = less glare. Less negative = brighter.
-CAMERA_EXPOSURE   = -7        # ← tune this with find_exposure.py
-
-# ── CLAHE contrast enhancement ────────────────────────────────────────────────
-# Applied only to the internal grayscale detection image, not the display.
-# clipLimit: 0.5 is gentle — enough to help detection without amplifying glare.
-CLAHE_CLIP_LIMIT  = 0.5
-CLAHE_TILE_SIZE   = (8, 8)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -85,12 +67,8 @@ class WebcamVideoStream:
     Threaded camera capture — opens the C922 at full 1920x1080 on Windows
     using CAP_DSHOW + MJPG, which is the only reliable way to get 1080p
     out of this camera via OpenCV on Windows.
-
-    Camera settings are left on auto as much as possible so the firmware
-    can do its own image processing, matching what the camera app produces.
     """
-    def __init__(self, src=1, width=1920, height=1080, fps=30,
-                 focus=0, exposure=-6):
+    def __init__(self, src=1, width=1920, height=1080, fps=30, focus=6):
         if platform.system() == "Windows":
             self.stream = cv2.VideoCapture(src, cv2.CAP_DSHOW)
         else:
@@ -101,15 +79,8 @@ class WebcamVideoStream:
         self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.stream.set(cv2.CAP_PROP_FPS,          fps)
         self.stream.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-
-        # Manual focus — fixed at infinity for overhead mount
-        self.stream.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-        self.stream.set(cv2.CAP_PROP_FOCUS,     focus)
-
-        # Hardcoded exposure — consistent every session, no auto-hunting
-        self.stream.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-        self.stream.set(cv2.CAP_PROP_EXPOSURE,      exposure)
-        print(f"[Camera] Exposure fixed at {exposure}")
+        self.stream.set(cv2.CAP_PROP_AUTOFOCUS,    0)
+        self.stream.set(cv2.CAP_PROP_FOCUS,        focus)
 
         self.stopped  = False
         self.grabbed, self.frame = self.stream.read()
@@ -138,76 +109,31 @@ class CameraTracker:
         self.server = server
         self.active_robot_ids = set(active_robot_ids)
 
-        # ── CLAHE for contrast enhancement on the detection channel only ──
-        # This improves marker detection without altering the display image.
-        self.clahe = cv2.createCLAHE(
-            clipLimit=CLAHE_CLIP_LIMIT,
-            tileGridSize=CLAHE_TILE_SIZE,
-        )
-
-        # ── ArUco detector ────────────────────────────────────────────────
+        # ArUco setup
         self.aruco_dict   = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.detector     = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
-        # Sub-pixel corner refinement for accurate position and heading
-        self.aruco_params.cornerRefinementMethod        = cv2.aruco.CORNER_REFINE_SUBPIX
-        self.aruco_params.cornerRefinementWinSize       = 5
-        self.aruco_params.cornerRefinementMaxIterations = 30
-        self.aruco_params.cornerRefinementMinAccuracy   = 0.01
-
-        # Wide adaptive threshold sweep — more passes = more chances to find
-        # markers under uneven or bright lighting
-        self.aruco_params.adaptiveThreshWinSizeMin  = 3
-        self.aruco_params.adaptiveThreshWinSizeMax  = 83
-        self.aruco_params.adaptiveThreshWinSizeStep = 2
-        self.aruco_params.adaptiveThreshConstant    = 15
-
-        # Lenient acceptance for small markers
-        self.aruco_params.minMarkerPerimeterRate      = 0.02
-        self.aruco_params.maxMarkerPerimeterRate      = 0.5
-        self.aruco_params.polygonalApproxAccuracyRate = 0.08
-        self.aruco_params.minCornerDistanceRate       = 0.02
-        self.aruco_params.minMarkerDistanceRate       = 0.02
-
-        # More samples per bit cell — helps on slightly soft/small markers
-        self.aruco_params.perspectiveRemovePixelPerCell         = 8
-        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.13
-
-        # Allow up to 60% bit errors before rejecting a candidate
-        self.aruco_params.errorCorrectionRate = 0.6
-
-        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
-
-        # ── Camera stream ─────────────────────────────────────────────────
+        # Camera — threaded stream for reliable 1080p on the C922
         self.vs = WebcamVideoStream(
             src=CAMERA_INDEX,
             width=FRAME_WIDTH,
             height=FRAME_HEIGHT,
             fps=FPS,
-            focus=CAMERA_FOCUS,
-            exposure=CAMERA_EXPOSURE,
+            focus=6,
         ).start()
 
         if not self.vs.grabbed:
             raise RuntimeError(f"[Tracker] Cannot open camera index {CAMERA_INDEX}")
         print(f"[Tracker] Camera opened ({FRAME_WIDTH}x{FRAME_HEIGHT})")
-        print("[Tracker] Camera ready.")
-
-    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Convert to grayscale and apply gentle CLAHE contrast enhancement.
-        Only used for ArUco detection — the display image is left untouched.
-        """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = self.clahe.apply(gray)
-        return gray
 
     def process_frame(self, frame: np.ndarray) -> dict[int, tuple[float, float, float]]:
         """
         Detect ArUco markers in frame and return position data for active robots.
         Returns: { robot_id: (x_m, y_m, theta_rad), ... }
         """
-        gray = self._preprocess(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.detector.detectMarkers(gray)
 
         positions = {}
@@ -236,13 +162,6 @@ class CameraTracker:
         """Draw detections and the world-origin crosshair onto the frame."""
         annotated = frame.copy()
 
-        # Arena boundary rectangle
-        x_min = int(CX - (SCENE_WIDTH_M  / 2) * PX_PER_M_X)
-        x_max = int(CX + (SCENE_WIDTH_M  / 2) * PX_PER_M_X)
-        y_min = int(CY - (SCENE_HEIGHT_M / 2) * PX_PER_M_Y)
-        y_max = int(CY + (SCENE_HEIGHT_M / 2) * PX_PER_M_Y)
-        cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-
         # World origin crosshair
         cross_size = 30
         cv2.line(annotated, (CX - cross_size, CY), (CX + cross_size, CY), (0, 255, 0), 2)
@@ -255,7 +174,7 @@ class CameraTracker:
             px = int(CX + x_m * PX_PER_M_X)
             py = int(CY - y_m * PX_PER_M_Y)
 
-            # Heading arrow
+            # Heading arrow — points in the direction the front of the robot faces
             arrow_len = 40
             ex = int(px + arrow_len * math.cos(theta))
             ey = int(py - arrow_len * math.sin(theta))
@@ -265,10 +184,6 @@ class CameraTracker:
             cv2.putText(annotated, label, (px + 10, py - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             cv2.circle(annotated, (px, py), 6, (255, 255, 0), -1)
-
-        # Detection count
-        cv2.putText(annotated, f"Detected: {len(positions)}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
         return annotated
 

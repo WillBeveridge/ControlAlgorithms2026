@@ -33,7 +33,7 @@ ARUCO_DICT = {
     "DICT_APRILTAG_36h11": cv2.aruco.DICT_APRILTAG_36h11
 }
 arucoDict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT["DICT_4X4_50"])
-tag = np.zeros((600, 600, 1), dtype='uint8')
+tag = np.zeros((375, 375, 1), dtype='uint8')
 # args, dict, id, sideLength, img variable, borderBits
-cv2.aruco.generateImageMarker(arucoDict, 1, 600, tag, 1)
+cv2.aruco.generateImageMarker(arucoDict, 1, 375, tag, 1)
 cv2.imwrite("aruco1.png", tag)

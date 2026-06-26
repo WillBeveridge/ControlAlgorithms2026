@@ -51,20 +51,20 @@
 #include <math.h>
 
 // ── Network — must match udp.py constants ───────────────────────────────────
-static const char*    WIFI_SSID      = "YourNetworkSSID";
-static const char*    WIFI_PASSWORD  = "YourNetworkPassword";
+static const char*    WIFI_SSID      = "RobotWifi";
+static const char*    WIFI_PASSWORD  = "12345678";
 static const uint16_t UDP_PORT       = 5005;
 
 // ── Robot identity ───────────────────────────────────────────────────────────
 // Set this to match the ArUco marker ID physically attached to this robot.
-static const uint8_t MY_ROBOT_ID = 0;
+static const uint8_t MY_ROBOT_ID = 1;
 
 // ── Arena bounds (metres from world origin) ──────────────────────────────────
 // Must match SCENE_WIDTH_M / SCENE_HEIGHT_M in tracker.py:
 //   SCENE_WIDTH_M = 2.0  → half-width  = 1.000 m
 //   SCENE_HEIGHT_M = 1.125 → half-height = 0.5625 m
-static constexpr float ARENA_W = 1.000f;   // ±X limit (metres)
-static constexpr float ARENA_H = 0.5625f;  // ±Y limit (metres)
+static constexpr float ARENA_W = 1.80f;   // ±X limit (metres)
+static constexpr float ARENA_H = 1.015f;  // ±Y limit (metres)
 
 // ── Collision / avoidance zones ──────────────────────────────────────────────
 // Robot–robot distances (centre to centre, metres)
@@ -210,7 +210,9 @@ static void setMotor(int pinA, int pinB, int pwmChan, int dir, uint8_t duty) {
         digitalWrite(pinB, LOW);
         clampedDuty = 0;
     }
-    ledcWrite(pwmChan, clampedDuty);
+    // NEW — write directly to the pin, not a channel number
+    int pin = (pwmChan == PWM_CHAN_LEFT) ? PIN_PWMA : PIN_PWMB;
+    ledcWrite(pin, clampedDuty);
 }
 
 /*
@@ -634,10 +636,9 @@ void setup() {
     digitalWrite(PIN_STBY, HIGH);   // enable motor driver
 
     // PWM channels (LEDC)
-    ledcSetup(PWM_CHAN_LEFT,  PWM_FREQ, PWM_RESOLUTION);
-    ledcSetup(PWM_CHAN_RIGHT, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttachPin(PIN_PWMA, PWM_CHAN_LEFT);
-    ledcAttachPin(PIN_PWMB, PWM_CHAN_RIGHT);
+    // NEW — core v3
+    ledcAttach(PIN_PWMA, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttach(PIN_PWMB, PWM_FREQ, PWM_RESOLUTION);
     stopMotors();
 
     // Hardware encoders
